@@ -938,7 +938,16 @@ class MoE(nn.Module):
             dist.all_reduce(y)
         return (y + z).view(shape)
 
+"""
+Block 类是 DeepSeek-V3 模型中的一个核心组件，它实现了 Transformer 架构中的基本构建块。
+每个 Block 包含一个注意力层和一个前馈网络层，这是现代大型语言模型的标准结构。
 
+Block 类继承自 PyTorch 的 nn.Module ，包含以下主要组件：
+
+1. 注意力层 (attn) : 实现为 MLA （多头注意力）类的实例
+2. 前馈网络 (ffn) : 根据层位置不同，可以是 MLP （多层感知机）或 MoE （混合专家）
+3. 层归一化 (attn_norm, ffn_norm) : 两个 RMSNorm 实例，分别用于注意力层和前馈网络的输入归一化
+"""
 class Block(nn.Module):
     """
     Transformer block combining attention and feed-forward layers.
@@ -954,11 +963,13 @@ class Block(nn.Module):
         Initializes the Transformer block.
 
         Args:
-            layer_id (int): Layer index in the transformer.
-            args (ModelArgs): Model arguments containing block parameters.
+            layer_id (int): Layer index in the transformer. 表示当前块在 Transformer 中的层索引
+            args (ModelArgs): Model arguments containing block parameters. 包含模型参数的 ModelArgs 实例
         """
         super().__init__()
         self.attn = MLA(args)
+        # 当 layer_id < args.n_dense_layers 时，使用标准的 MLP,否则使用 MoE （混合专家系统）
+        # 这种设计允许模型在浅层使用密集计算，而在深层使用更高效的稀疏专家混合，平衡了计算效率和模型表达能力。
         self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
@@ -976,14 +987,47 @@ class Block(nn.Module):
         Returns:
             torch.Tensor: Output tensor after block computation.
         """
+        """
+        注意力计算 :
+        - 对输入 x 应用层归一化 ( self.attn_norm(x) )
+        - 将归一化后的输入传递给注意力层 ( self.attn(...) )
+        - 将注意力层的输出与原始输入相加（残差连接）
+        """
         x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
+        """
+        前馈网络计算 :
+
+        - 对上一步的结果应用层归一化 ( self.ffn_norm(x) )
+        - 将归一化后的输入传递给前馈网络 ( self.ffn(...) )
+        - 将前馈网络的输出与上一步的结果相加（第二个残差连接）
+        """
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
+"""
+Transformer 类继承自 PyTorch 的 nn.Module ，包含了以下主要组件：
 
+1. 词嵌入层 ( embed )
+2. Transformer 层序列 ( layers )
+3. 最终层归一化 ( norm )
+4. 输出投影层 ( head )
+5. 位置编码 ( freqs_cis )
+"""
 class Transformer(nn.Module):
     """
     Transformer model with positional embeddings, multiple layers, and output projection.
+
+初始化过程中首先设置了分布式环境变量：
+
+- 获取当前分布式环境的设备总数 ( world_size ) 和当前设备的序号 ( rank )
+- 根据配置参数设置线性层的数据类型，支持 FP8 或 BF16 精度
+然后创建模型的各个组件：
+
+- 设置最大序列长度
+- 创建并行嵌入层，用于将输入 token 转换为向量表示
+- 创建多个 Transformer 层，每层是一个 Block 实例
+- 创建最终的层归一化和输出投影层
+- 预计算并注册旋转位置编码 ( freqs_cis )
 
     Attributes:
         max_seq_len (int): Maximum sequence length for the transformer.
@@ -1018,6 +1062,35 @@ class Transformer(nn.Module):
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
         """
         Forward pass for the Transformer model.
+
+前向传播方法使用了 @torch.inference_mode() 装饰器，表明该方法仅用于推理，不会计算梯度。
+
+处理流程如下：
+
+1. 获取输入序列长度 seqlen
+2. 通过嵌入层将输入 token 转换为向量表示 h
+3. 从预计算的位置编码中获取当前序列对应的部分
+4. 对于长度大于 1 的序列，创建注意力掩码 mask ，实现自回归生成
+   - 掩码是一个上三角矩阵，对角线以上的值为负无穷，确保每个位置只能看到自己及之前的位置
+5. 依次通过每个 Transformer 层，更新隐藏状态 h
+6. 对最终的隐藏状态应用层归一化，并只保留最后一个位置的表示 [:, -1]
+7. 通过输出投影层将隐藏状态映射到词汇表大小的 logits
+8. 在分布式环境中，收集并合并所有设备的 logits
+
+## 分布式计算支持
+代码中包含了多处分布式计算的支持：
+
+1. 初始化时设置全局的 world_size 和 rank 变量
+2. 使用 ParallelEmbedding 和 ColumnParallelLinear 等分布式层
+3. 在前向传播的最后使用 dist.all_gather 收集所有设备的输出结果
+## 性能优化
+代码中包含了多种性能优化技术：
+
+1. 使用低精度计算 (FP8 或 BF16)，减少内存使用和提高计算速度
+2. 预计算位置编码，避免重复计算
+3. 使用 persistent=False 标记缓冲区，优化内存使用
+4. 使用 inference_mode() 而非 no_grad() ，进一步优化推理性能
+这个 Transformer 类是 DeepSeek-V3 模型的核心实现，它结合了现代 Transformer 架构的多项技术创新，包括旋转位置编码、混合专家系统、分布式计算和量化推理等，使模型能够高效地处理长序列并在多设备环境中运行。
 
         Args:
             tokens (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
