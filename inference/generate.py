@@ -48,6 +48,7 @@ def generate(
     Returns:
         List[List[int]]: A list of lists containing the generated tokens for each sequence.
     """
+    # 当批量生成时，prompt_tokens 是一个列表，列表中每个元素是一个列表，表示一个prompt的token序列
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
     total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
@@ -57,16 +58,26 @@ def generate(
     prev_pos = 0
     finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
     prompt_mask = tokens != -1
+    # 从prompt的结束位置开始生成
     for cur_pos in range(min(prompt_lens), total_len):
+        # 输入最后生成的一个token，预测下一个token
+        # 这里只输入了最后一个token，前面的token不需要重复输入的原因是：KV缓存机制
+        # 模型内部会缓存之前所有token的注意力计算结果（key和value）
+        # prev_pos 参数告诉模型："之前0到prev_pos的tokens的计算结果已经被缓存了"
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
         if temperature > 0:
+            # 使用温度采样
             next_token = sample(logits, temperature)
         else:
             next_token = logits.argmax(dim=-1)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+        # 拼接生成的token
         tokens[:, cur_pos] = next_token
+        # 如果当前位置不是prompt的结束位置，并且生成的token是eos_id，则将finished设置为True
         finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
+        # 更新prev_pos
         prev_pos = cur_pos
+        # 如果所有prompt都生成了eos_id，则停止生成
         if finished.all():
             break
     completion_tokens = []
