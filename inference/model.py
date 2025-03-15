@@ -670,6 +670,10 @@ class MLP(nn.Module):
         - 使用 ColumnParallelLinear 而不是标准的 nn.Linear ，支持模型并行
         - 将输入从 dim 维度映射到 inter_dim 维度
         - 列并行意味着输出特征被分割到不同的设备上
+
+        输入x的形状为 (batch_size, dim)
+        每个设备的weight的形状为 (dim, inter_dim // world_size)
+        每个设备的输出y的形状为 (batch_size, inter_dim // world_size)
         """
         self.w1 = ColumnParallelLinear(dim, inter_dim)
         """
@@ -677,12 +681,20 @@ class MLP(nn.Module):
         - 使用 RowParallelLinear ，同样支持模型并行
         - 将中间表示从 inter_dim 维度映射回 dim 维度
         - 行并行意味着输入特征被分割到不同的设备上
+
+        输入x的形状为 (batch_size, inter_dim // world_size)
+        每个设备的weight的形状为 (inter_dim // world_size, dim)
+        每个设备的输出y的形状为 (batch_size, dim)，并使用all_reduce，将所有设备上的数据求和，最终y的形状仍然为 (batch_size, dim)
         """
         self.w2 = RowParallelLinear(inter_dim, dim)
         """
         - 创建第三个线性变换层 w3
         - 与 w1 类似，也是从 dim 映射到 inter_dim
         - 这是 SwiGLU 激活函数所需的额外线性变换
+
+        输入x的形状为 (batch_size, dim)
+        每个设备的weight的形状为 (dim, inter_dim // world_size)
+        每个设备的输出y的形状为 (batch_size, inter_dim // world_size)
         """
         self.w3 = ColumnParallelLinear(dim, inter_dim)
 
@@ -1108,6 +1120,14 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)[:, -1]
+        # self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
+        # 使用 ColumnParallelLinear ，支持模型并行
+        # 将输入从 dim 维度映射到 vocab_size 维度
+        # 行并行意味着输入特征被分割到不同的设备上
+        # 输入h的形状为 (batch_size, dim)
+        # 每个设备的weight的形状为 (dim, vocab_size // world_size)
+        # 每个设备的输出y的形状为 (batch_size, vocab_size // world_size)
+        # 使用all_gather，收集每个设备的输出，并将它们拼接在一起，最终y的形状为 (batch_size, vocab_size)
         logits = self.head(h)
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
